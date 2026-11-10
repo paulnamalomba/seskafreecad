@@ -477,6 +477,7 @@ System::System()
     , hasDiagnosis(false)
     , isInit(false)
     , emptyDiagnoseMatrix(true)
+    , diagnosisSupplied(false)
     , maxIter(100)
     , maxIterRedundant(100)
     , sketchSizeMultiplier(false)
@@ -523,6 +524,7 @@ void System::clear()
     pDependentParametersGroups.clear();
     hasUnknowns = false;
     hasDiagnosis = false;
+    diagnosisSupplied = false;
 
     emptyDiagnoseMatrix = true;
 
@@ -541,6 +543,7 @@ void System::clear()
 void System::invalidatedDiagnosis()
 {
     hasDiagnosis = false;
+    diagnosisSupplied = false;
     pDependentParameters.clear();
     pDependentParametersGroups.clear();
 }
@@ -1869,7 +1872,52 @@ void System::resetToReference()
 int System::solve(VEC_pD& params, bool isFine, Algorithm alg, bool isRedundantsolving)
 {
     declareUnknowns(params);
+    if (diagnosisSupplied) {
+        // a set supplied through solveWithSuppliedRedundancy() is not a diagnosis of this call
+        hasDiagnosis = false;
+    }
     initSolution();
+    return solve(isFine, alg, isRedundantsolving);
+}
+
+int System::solveWithSuppliedRedundancy(
+    VEC_pD& params,
+    const std::vector<int>& omittedTags,
+    Algorithm alg,
+    bool isFine,
+    bool isRedundantsolving
+)
+{
+    declareUnknowns(params);
+
+    // initSolution() calls diagnose() only while hasDiagnosis is false, and diagnose() builds a
+    // dense clist x plist Jacobian (makeReducedJacobian). The caller's redundancy replaces it.
+    // Only driving constraints with tag >= 0 take part in a diagnosis, so only they can be omitted.
+    const std::set<int> omitted(omittedTags.begin(), omittedTags.end());
+    redundant.clear();
+    conflictingTags.clear();
+    redundantTags.clear();
+    partiallyRedundantTags.clear();
+    pDependentParameters.clear();
+    pDependentParametersGroups.clear();
+    std::set<int> present;
+    bool anyDriving = false;
+    for (const auto constr : clist) {
+        if (constr->getTag() >= 0 && constr->isDriving()) {
+            anyDriving = true;
+            if (omitted.count(constr->getTag()) != 0) {
+                redundant.insert(constr);
+                present.insert(constr->getTag());
+            }
+        }
+    }
+    redundantTags.assign(present.begin(), present.end());
+    dofs = -1;
+    emptyDiagnoseMatrix = !anyDriving;
+    hasDiagnosis = true;
+    diagnosisSupplied = true;
+
+    initSolution(alg);
     return solve(isFine, alg, isRedundantsolving);
 }
 
@@ -1899,6 +1947,20 @@ int System::solve(bool isFine, Algorithm alg, bool isRedundantsolving)
         }
     }
     if (res == Success) {
+        // The SubSystems hold the solution until applySolution(), so error() below sees the values
+        // from before the solve. That is how upstream checks a diagnosed redundant constraint. For a
+        // set supplied through solveWithSuppliedRedundancy() the omitted constraints are checked at
+        // the solved values instead: the solution is applied for the check and the previous values
+        // are restored.
+        VEC_D previous;
+        const bool atSolution = diagnosisSupplied && !redundant.empty();
+        if (atSolution) {
+            previous.reserve(plist.size());
+            for (const auto& param : plist) {
+                previous.push_back(*param);
+            }
+            applySolution();
+        }
         for (std::set<Constraint*>::const_iterator constr = redundant.begin();
              constr != redundant.end();
              ++constr) {
@@ -1908,7 +1970,12 @@ int System::solve(bool isFine, Algorithm alg, bool isRedundantsolving)
             double err = (*constr)->error();
             if (err * err > (isRedundantsolving ? convergenceRedundant : convergence)) {
                 res = Converged;
-                return res;
+                break;
+            }
+        }
+        if (atSolution) {
+            for (std::size_t i = 0; i < plist.size(); ++i) {
+                *plist[i] = previous[i];
             }
         }
     }
@@ -4748,6 +4815,7 @@ int System::diagnose(Algorithm alg)
     //         two high priority constraints. For this reason, tagging
     //         constraints with 0 should be used carefully.
     hasDiagnosis = false;
+    diagnosisSupplied = false;
     if (!hasUnknowns) {
         dofs = -1;
         return dofs;

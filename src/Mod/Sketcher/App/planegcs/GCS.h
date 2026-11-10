@@ -143,6 +143,10 @@ private:
 
     bool emptyDiagnoseMatrix;  // false only if there is at least one driving constraint.
 
+    // true while the redundancy state was supplied through solveWithSuppliedRedundancy() and
+    // diagnose() has not replaced it
+    bool diagnosisSupplied;
+
     int solve_BFGS(SubSystem* subsys, bool isFine = true, bool isRedundantsolving = false);
     int solve_LM(SubSystem* subsys, bool isRedundantsolving = false);
     int solve_DL(SubSystem* subsys, bool isRedundantsolving = false);
@@ -585,6 +589,42 @@ public:
 
     int solve(bool isFine = true, Algorithm alg = DogLeg, bool isRedundantsolving = false);
     int solve(VEC_pD& params, bool isFine = true, Algorithm alg = DogLeg, bool isRedundantsolving = false);
+    // Solves with a redundancy set supplied by the caller instead of the internal diagnosis.
+    // Driving constraints whose tag is in omittedTags (tag >= 0) are left out of the solved
+    // system, as diagnosed redundant constraints are. diagnose() is not called, so no
+    // whole-system Jacobian is formed. Partitioning, equality reduction and the per-component
+    // solve are those of initSolution(); the solve is solve(isFine, alg, isRedundantsolving) with
+    // one difference. Upstream solve() checks each omitted constraint at the parameter values from
+    // before the solve, because the omitted constraint is not redirected to the SubSystem storage
+    // that holds the solution until applySolution(). After this entry point the check is made at
+    // the solved values: solve() writes the solution into the parameters, evaluates the omitted
+    // constraints, and restores the previous values. A compatible omitted constraint therefore no
+    // longer ends the solve with Converged.
+    // The supplied set stands in for the diagnosis until diagnose() runs or a constraint with
+    // tag >= 0 is added or removed: dofsNumber() is -1, the conflicting and partially redundant
+    // lists are empty, and getRedundant() returns the omitted tags that name a driving constraint.
+    // solve(VEC_pD&, ...) after this call diagnoses as it did before, and does not reuse the
+    // supplied set. alg comes third, as in a call written (params, omittedTags, alg): a bool in
+    // that position does not convert to Algorithm.
+    // After std::bad_alloc or any other exception from a solve, destroy the System: constraints
+    // may still point at SubSystem storage.
+    // Obligations of a caller that uses this entry point (SESKAFEA C1.4b adapter):
+    //  1. After Success call applySolution() and copy the values before any diagnose(): the
+    //     confirmation solve inside diagnose() writes into the parameters and ends in
+    //     resetToReference(), and an exception inside it can leave confirmation values in them.
+    //  2. A diagnose() that throws std::bad_alloc, runs out of time or is cancelled is informational:
+    //     report it as such, destroy the System, and never turn it into a failure of the solve (for
+    //     example SolverMemory) or raise the memory cap for it. The diagnosis can need far more memory
+    //     than the solve.
+    //  3. Create only driving constraints with tag >= 0. Any other constraint puts its component on the
+    //     two-SubSystem solve, which allocates dense xsize x xsize matrices.
+    int solveWithSuppliedRedundancy(
+        VEC_pD& params,
+        const std::vector<int>& omittedTags,
+        Algorithm alg = DogLeg,
+        bool isFine = true,
+        bool isRedundantsolving = false
+    );
     int solve(
         SubSystem* subsys,
         bool isFine = true,
