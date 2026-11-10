@@ -158,6 +158,18 @@ private:
         std::map<int, int>& tagmultiplicity
     );
 
+    // sparseDiagnosis: the reduced Jacobian holds only its structural nonzeros (rows are the
+    // driving constraints, with no zero padding for the other constraints).
+    void makeReducedJacobianSparse(
+        Eigen::SparseMatrix<double>& J,
+        std::map<int, int>& jacobianconstraintmap,
+        GCS::VEC_pD& pdiagnoselist,
+        std::map<int, int>& tagmultiplicity
+    );
+
+    // diagnose() for sparseDiagnosis: sparse Jacobian, sparse QR and no dense R matrix.
+    int diagnoseSparse(Algorithm alg);
+
     void makeDenseQRDecomposition(
         const Eigen::MatrixXd& J,
         const std::map<int, int>& jacobianconstraintmap,
@@ -177,6 +189,16 @@ private:
         Eigen::MatrixXd& R,
         bool transposeJ = true,
         bool silent = false
+    );
+#endif
+#ifdef EIGEN_SPARSEQR_COMPATIBLE
+    // Sparse QR of J (transposeJ false) or of its transpose, for sparseDiagnosis. The rank is set
+    // as in the dense-Jacobian overload above.
+    void makeSparseQRDecomposition(
+        const Eigen::SparseMatrix<double>& J,
+        Eigen::SparseQR<Eigen::SparseMatrix<double>, Eigen::COLAMDOrdering<int>>& SqrJ,
+        int& rank,
+        bool transposeJ
     );
 #endif
     // This function name is long for a reason:
@@ -199,6 +221,18 @@ private:
         Eigen::MatrixXd& R,
         int constrNum,
         int rank,
+        int& nonredundantconstrNum
+    );
+
+    // The part of identifyConflictingRedundantConstraints that follows the grouping of the
+    // dependent constraints: it chooses the constraints to skip, confirms the choice by a solve and
+    // fills redundant, conflictingTags, redundantTags and partiallyRedundantTags.
+    void identifyConflictingRedundantFromGroups(
+        Algorithm alg,
+        std::vector<std::vector<Constraint*>>& conflictGroups,
+        const std::map<int, int>& tagmultiplicity,
+        GCS::VEC_pD& pdiagnoselist,
+        int constrNum,
         int& nonredundantconstrNum
     );
 
@@ -243,6 +277,17 @@ public:
     QRAlgorithm qrAlgorithm;
     bool autoChooseAlgorithm;
     int autoQRThreshold;
+    // If true, diagnose() assembles the reduced Jacobian as a sparse matrix and uses the sparse QR
+    // without a dense R matrix, so no dense matrix proportional to the whole system is formed.
+    // Upstream's rule is kept: with autoChooseAlgorithm true, a system with fewer than
+    // autoQRThreshold parameters still takes the dense QR path (FreeCAD issue 10903, sparse QR
+    // failing rank detection on aligned slots), so sparseDiagnosis changes only larger systems.
+    // With autoChooseAlgorithm false the sparse path is used at every size. The dependent groups
+    // are the same as those of the sparse QR path with a dense Jacobian. The QR of J^T has the
+    // fill of the Cholesky factor of J J^T: constraints that share an unknown make it denser.
+    // Without Eigen's sparse module (before 3.2.2) the switch has no effect.
+    // Default false: diagnose() is as upstream.
+    bool sparseDiagnosis;
     DogLegGaussStep dogLegGaussStep;
     double qrpivotThreshold;
     DebugMode debugMode;

@@ -487,6 +487,7 @@ System::System()
     , qrAlgorithm(EigenSparseQR)
     , autoChooseAlgorithm(true)
     , autoQRThreshold(1000)
+    , sparseDiagnosis(false)
     , dogLegGaussStep(FullPivLU)
     , qrpivotThreshold(1E-13)
     , debugMode(Minimal)
@@ -4847,6 +4848,19 @@ int System::diagnose(Algorithm alg)
     redundantTags.clear();
     partiallyRedundantTags.clear();
 
+#ifdef EIGEN_SPARSEQR_COMPATIBLE
+    if (sparseDiagnosis) {
+        // upstream's size rule: below autoQRThreshold parameters the dense QR stays in use
+        const std::set<double*> drivenParams(pdrivenlist.begin(), pdrivenlist.end());
+        const auto diagnosedParams = std::ranges::count_if(plist, [&drivenParams](double* param) {
+            return drivenParams.count(param) == 0;
+        });
+        if (!autoChooseAlgorithm || diagnosedParams >= autoQRThreshold) {
+            return diagnoseSparse(alg);
+        }
+    }
+#endif
+
     // This QR diagnosis uses a reduced Jacobian matrix to calculate the rank of the system
     // and identify conflicting and redundant constraints.
     //
@@ -5283,6 +5297,230 @@ void System::makeSparseQRDecomposition(
 }
 #endif  // EIGEN_SPARSEQR_COMPATIBLE
 
+void System::makeReducedJacobianSparse(
+    Eigen::SparseMatrix<double>& J,
+    std::map<int, int>& jacobianconstraintmap,
+    GCS::VEC_pD& pdiagnoselist,
+    std::map<int, int>& tagmultiplicity
+)
+{
+    // same parameter list as makeReducedJacobian: ignore the parameters of driven constraints
+    const std::set<double*> driven(pdrivenlist.begin(), pdrivenlist.end());
+    for (int j = 0; j < int(plist.size()); j++) {
+        if (driven.count(plist[j]) == 0) {
+            pdiagnoselist.push_back(plist[j]);
+        }
+    }
+
+    MAP_pD_I column;
+    for (int j = 0; j < int(pdiagnoselist.size()); j++) {
+        column[pdiagnoselist[j]] = j;
+    }
+
+    // Only the parameters a constraint depends on can have a nonzero gradient, so only those are
+    // evaluated, and only the nonzero gradients are stored.
+    std::vector<Eigen::Triplet<double>> entries;
+    int jacobianconstraintcount = 0;
+    int allcount = 0;
+    for (auto& constr : clist) {
+        constr->revertParams();
+        ++allcount;
+        if (constr->getTag() >= 0 && constr->isDriving()) {
+            jacobianconstraintcount++;
+            std::set<int> seen;
+            for (double* param : constr->params()) {
+                const auto it = column.find(param);
+                if (it == column.end() || !seen.insert(it->second).second) {
+                    continue;
+                }
+                const double value = constr->grad(param);
+                if (value != 0.0) {
+                    entries.emplace_back(jacobianconstraintcount - 1, it->second, value);
+                }
+            }
+
+            // parallel processing: create tag multiplicity map
+            if (tagmultiplicity.find(constr->getTag()) == tagmultiplicity.end()) {
+                tagmultiplicity[constr->getTag()] = 0;
+            }
+            else {
+                tagmultiplicity[constr->getTag()]++;
+            }
+
+            jacobianconstraintmap[jacobianconstraintcount - 1] = allcount - 1;
+        }
+    }
+
+    if (jacobianconstraintcount == 0) {  // only driven constraints
+        J.resize(0, 0);
+    }
+    else {
+        J.resize(jacobianconstraintcount, pdiagnoselist.size());
+        J.setFromTriplets(entries.begin(), entries.end());
+        J.makeCompressed();
+    }
+}
+
+#ifdef EIGEN_SPARSEQR_COMPATIBLE
+void System::makeSparseQRDecomposition(
+    const Eigen::SparseMatrix<double>& J,
+    Eigen::SparseQR<Eigen::SparseMatrix<double>, Eigen::COLAMDOrdering<int>>& SqrJ,
+    int& rank,
+    bool transposeJ
+)
+{
+    rank = 0;
+    if (J.rows() > 0) {
+        Eigen::SparseMatrix<double> SJG;
+        if (transposeJ) {
+            SJG = J.transpose();
+        }
+        else {
+            SJG = J;
+        }
+        SJG.makeCompressed();
+
+        if (SJG.rows() > 0 && SJG.cols() > 0) {
+            SqrJ.compute(SJG);
+            // As upstream, set after compute(): Eigen has already fixed the rank with its default
+            // threshold, 20 (m + n) eps max |column|, so qrpivotThreshold has no effect here.
+            SqrJ.setPivotThreshold(qrpivotThreshold);
+            rank = SqrJ.rank();
+        }
+    }
+}
+
+namespace
+{
+// The rank-deficient columns of a sparse QR in the form identifyDependentParameters() and
+// identifyConflictingRedundantConstraints() read them from a dense R: for every column j >= rank,
+// the original columns (through the column permutation) of the rows whose entry of R after
+// eliminateNonZerosOverPivotInUpperTriangularMatrix() exceeds 1e-10, in row order, followed by the
+// original column of j itself. That elimination turns R11 (the rank x rank block) into its diagonal
+// D and R12 into D R11^-1 R12, so each column is one sparse triangular solve and no dense R exists.
+std::vector<std::vector<int>> sparseDependencyGroups(
+    const Eigen::SparseQR<Eigen::SparseMatrix<double>, Eigen::COLAMDOrdering<int>>& qr,
+    int rank
+)
+{
+    const Eigen::SparseMatrix<double>& R = qr.matrixR();
+    const int cols = static_cast<int>(R.cols());
+    std::vector<std::vector<int>> groups(cols > rank ? cols - rank : 0);
+    if (cols <= rank) {
+        return groups;
+    }
+
+    const auto R11 = R.topLeftCorner(rank, rank);  // a view: no copy of the factor
+    Eigen::VectorXd diagonal = Eigen::VectorXd::Zero(rank);
+    for (int row = 0; row < rank; ++row) {
+        diagonal[row] = R.coeff(row, row);
+    }
+
+    const auto& indices = qr.colsPermutation().indices();
+    Eigen::VectorXd x(rank);
+    for (int j = rank; j < cols; ++j) {
+        std::vector<int>& group = groups[j - rank];
+        if (rank > 0) {
+            x.setZero();
+            for (Eigen::SparseMatrix<double>::InnerIterator it(R, j); it; ++it) {
+                if (it.row() < rank) {
+                    x[it.row()] = it.value();
+                }
+            }
+            R11.triangularView<Eigen::Upper>().solveInPlace(x);
+            for (int row = 0; row < rank; ++row) {
+                if (fabs(diagonal[row] * x[row]) > 1e-10) {
+                    group.push_back(indices[row]);
+                }
+            }
+        }
+        group.push_back(indices[j]);
+    }
+    return groups;
+}
+}  // namespace
+#endif  // EIGEN_SPARSEQR_COMPATIBLE
+
+int System::diagnoseSparse(Algorithm alg)
+{
+    // The body of diagnose() after the clearing of the previous result, for sparseDiagnosis. The
+    // reduced Jacobian is sparse, the sparse QR is always used and the R matrices stay sparse. The
+    // two QR decompositions run one after the other, so only one factor is alive at a time.
+    Eigen::SparseMatrix<double> J;
+    std::map<int, int> jacobianconstraintmap;
+    GCS::VEC_pD pdiagnoselist;
+    std::map<int, int> tagmultiplicity;
+
+    makeReducedJacobianSparse(J, jacobianconstraintmap, pdiagnoselist, tagmultiplicity);
+
+    hasDiagnosis = true;
+    dofs = pdiagnoselist.size();
+
+    if (J.rows() == 0) {
+        return dofs;
+    }
+    emptyDiagnoseMatrix = false;
+
+#ifdef EIGEN_SPARSEQR_COMPATIBLE
+    {
+        // dependent parameters: QR of J, whose columns are the parameters
+        Eigen::SparseQR<Eigen::SparseMatrix<double>, Eigen::COLAMDOrdering<int>> SqrJ;
+        int nontransprank = 0;
+        makeSparseQRDecomposition(J, SqrJ, nontransprank, false);
+
+        const auto groups = sparseDependencyGroups(SqrJ, nontransprank);
+        pDependentParametersGroups.resize(groups.size());
+        for (std::size_t g = 0; g < groups.size(); ++g) {
+            for (const int origCol : groups[g]) {
+                pDependentParametersGroups[g].push_back(pdiagnoselist[origCol]);
+                pDependentParameters.push_back(pdiagnoselist[origCol]);
+            }
+        }
+    }
+
+    // conflicting and redundant constraints: QR of the transpose of J
+    Eigen::SparseQR<Eigen::SparseMatrix<double>, Eigen::COLAMDOrdering<int>> SqrJT;
+    int rank = 0;
+    makeSparseQRDecomposition(J, SqrJT, rank, true);
+
+    const int paramsNum = SqrJT.rows();
+    const int constrNum = SqrJT.cols();
+
+    dofs = paramsNum - rank;  // unless overconstraint, which will be overridden below
+
+    // Detecting conflicting or redundant constraints
+    if (constrNum > rank) {
+        const auto groups = sparseDependencyGroups(SqrJT, rank);
+        std::vector<std::vector<Constraint*>> conflictGroups(groups.size());
+        for (std::size_t g = 0; g < groups.size(); ++g) {
+            for (const int origCol : groups[g]) {
+                conflictGroups[g].push_back(clist[jacobianconstraintmap.at(origCol)]);
+            }
+        }
+
+        int nonredundantconstrNum;
+        identifyConflictingRedundantFromGroups(
+            alg,
+            conflictGroups,
+            tagmultiplicity,
+            pdiagnoselist,
+            constrNum,
+            nonredundantconstrNum
+        );
+
+        if (paramsNum == rank && nonredundantconstrNum > rank) {
+            // over-constrained
+            dofs = paramsNum - nonredundantconstrNum;
+        }
+    }
+#else
+    // Not reached: diagnose() compiles the call out without Eigen's sparse module.
+    (void)alg;
+#endif
+
+    return dofs;
+}
+
 void System::identifyDependentParametersDenseQR(
     const Eigen::MatrixXd& J,
     const std::map<int, int>& jacobianconstraintmap,
@@ -5517,6 +5755,25 @@ void System::identifyConflictingRedundantConstraints(
         conflictGroups[j - rank].push_back(clist[jacobianconstraintmap.at(origCol)]);
     }
 
+    identifyConflictingRedundantFromGroups(
+        alg,
+        conflictGroups,
+        tagmultiplicity,
+        pdiagnoselist,
+        constrNum,
+        nonredundantconstrNum
+    );
+}
+
+void System::identifyConflictingRedundantFromGroups(
+    Algorithm alg,
+    std::vector<std::vector<Constraint*>>& conflictGroups,
+    const std::map<int, int>& tagmultiplicity,
+    GCS::VEC_pD& pdiagnoselist,
+    int constrNum,
+    int& nonredundantconstrNum
+)
+{
     // Augment the information regarding the group of constraints that are conflicting or redundant.
     if (debugMode == IterationLevel) {
         SolverReportingManager::Manager().LogGroupOfConstraints(
@@ -5536,7 +5793,10 @@ void System::identifyConflictingRedundantConstraints(
         // such time it is empty and the infinite loop is exited. The guarantee that the loop will
         // be exited originates from the fact that in each iteration the algorithm will select one
         // constraint from the conflict groups, which will satisfy at least one group.
-        std::map<Constraint*, SET_I> conflictingMap;
+        // Groups are visited in increasing order and a constraint occurs at most once in a group, so a
+        // vector of group indices holds the same set as SET_I did, in one int per entry instead of a
+        // tree node. Entries are the number of (group, member) pairs, which grows with rows x rank.
+        std::map<Constraint*, std::vector<int>> conflictingMap;
         for (std::size_t i = 0; i < conflictGroups.size(); i++) {
             if (satisfiedGroups.count(i) != 0) {
                 continue;
@@ -5548,7 +5808,7 @@ void System::identifyConflictingRedundantConstraints(
                 bool priorityconstraint = (constr->getTag() == 0);
                 if (!priorityconstraint && !isinternalalignment) {
                     // exclude constraints tagged with zero and internal alignment
-                    conflictingMap[constr].insert(i);
+                    conflictingMap[constr].push_back(static_cast<int>(i));
                 }
             }
         }
@@ -5663,7 +5923,7 @@ void System::identifyConflictingRedundantConstraints(
         }
 
         // TODO: Figure out why we need to iterate in reverse order and add explanation here.
-        std::vector<std::vector<Constraint*>> conflictGroupsOrig = conflictGroups;
+        std::vector<std::vector<Constraint*>> conflictGroupsOrig = std::move(conflictGroups);
         conflictGroups.clear();
         for (int i = conflictGroupsOrig.size() - 1; i >= 0; i--) {
             auto iterRedundantEntry = std::ranges::find_if(
@@ -5672,7 +5932,7 @@ void System::identifyConflictingRedundantConstraints(
             );
             bool hasRedundant = (iterRedundantEntry != conflictGroupsOrig[i].end());
             if (!hasRedundant) {
-                conflictGroups.push_back(conflictGroupsOrig[i]);
+                conflictGroups.push_back(std::move(conflictGroupsOrig[i]));
                 continue;
             }
 
