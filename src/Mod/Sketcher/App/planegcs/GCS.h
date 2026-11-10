@@ -227,6 +227,19 @@ private:
     // The part of identifyConflictingRedundantConstraints that follows the grouping of the
     // dependent constraints: it chooses the constraints to skip, confirms the choice by a solve and
     // fills redundant, conflictingTags, redundantTags and partiallyRedundantTags.
+    // Solves the system of the non-skipped driving constraints for the confirmation step of the
+    // diagnosis. The SubSystems it creates are returned in subsystems, and solved[i] is 1 when
+    // subsystems[i] reached Success; the caller applies solutions and deletes the SubSystems. With
+    // componentwiseDiagnosisSolve each connected component of the constraint-parameter graph is
+    // solved on its own, otherwise one SubSystem holds all. The return value is the worst status.
+    int solveRedundancyConfirmation(
+        std::vector<Constraint*>& clistTmp,
+        GCS::VEC_pD& params,
+        Algorithm alg,
+        std::vector<SubSystem*>& subsystems,
+        std::vector<char>& solved
+    );
+
     void identifyConflictingRedundantFromGroups(
         Algorithm alg,
         std::vector<std::vector<Constraint*>>& conflictGroups,
@@ -288,6 +301,20 @@ public:
     // Without Eigen's sparse module (before 3.2.2) the switch has no effect.
     // Default false: diagnose() is as upstream.
     bool sparseDiagnosis;
+    // If true, the solve that confirms the redundant constraints chosen by diagnose() solves each
+    // connected component of the constraint-parameter graph with its own SubSystem, trust region
+    // and convergence test, as solve() does for the whole sketch, instead of one SubSystem of all
+    // constraints and parameters. Upstream applies nothing, and confirms no redundant constraint,
+    // unless the one solve succeeds, so a single component that does not converge leaves every
+    // other component unconfirmed. With this switch the solutions of the components that reach
+    // Success are applied and their skipped constraints are confirmed; the skipped constraints of a
+    // component that does not converge are judged at the values from before the solve.
+    // Differences from the single solve: each component has its own iteration budget when
+    // sketchSizeMultiplierRedundant is set; the tolerance of a constraint that depends on no
+    // unknown is DL_tolfRedundant, which is the DogLeg tolerance (the other algorithms use their
+    // own); and a system with no unknown at all is solved as upstream (Success). Default false:
+    // as upstream.
+    bool componentwiseDiagnosisSolve;
     DogLegGaussStep dogLegGaussStep;
     double qrpivotThreshold;
     DebugMode debugMode;

@@ -488,6 +488,7 @@ System::System()
     , autoChooseAlgorithm(true)
     , autoQRThreshold(1000)
     , sparseDiagnosis(false)
+    , componentwiseDiagnosisSolve(false)
     , dogLegGaussStep(FullPivLU)
     , qrpivotThreshold(1E-13)
     , debugMode(Minimal)
@@ -5765,6 +5766,83 @@ void System::identifyConflictingRedundantConstraints(
     );
 }
 
+int System::solveRedundancyConfirmation(
+    std::vector<Constraint*>& clistTmp,
+    GCS::VEC_pD& params,
+    Algorithm alg,
+    std::vector<SubSystem*>& subsystems,
+    std::vector<char>& solved
+)
+{
+    if (!componentwiseDiagnosisSolve || params.empty()) {
+        // params.empty(): no unknown at all, which upstream's single SubSystem solves as Success
+        subsystems.push_back(new SubSystem(clistTmp, params));
+        const int status = solve(subsystems.back(), true, alg, true);
+        solved.push_back(status == Success ? 1 : 0);
+        return status;
+    }
+
+    // Connected components of the constraint-parameter graph, as in initSolution().
+    MAP_pD_I index;
+    for (int i = 0; i < int(params.size()); ++i) {
+        index[params[i]] = i;
+    }
+    Graph g;
+    for (int i = 0; i < int(params.size() + clistTmp.size()); i++) {
+        boost::add_vertex(g);
+    }
+    int cvtid = int(params.size());
+    for (const auto constr : clistTmp) {
+        constr->revertParams();
+        for (const auto param : constr->params()) {
+            const auto it = index.find(param);
+            if (it != index.end()) {
+                boost::add_edge(cvtid, it->second, g);
+            }
+        }
+        ++cvtid;
+    }
+
+    VEC_I components(boost::num_vertices(g));
+    int componentsSize = 0;
+    if (!components.empty()) {
+        componentsSize = boost::connected_components(g, &components[0]);
+    }
+
+    std::vector<std::vector<Constraint*>> componentConstraints(componentsSize);
+    std::vector<VEC_pD> componentParams(componentsSize);
+    for (std::size_t i = 0; i < params.size(); ++i) {
+        componentParams[components[i]].push_back(params[i]);
+    }
+    std::size_t i = params.size();
+    for (const auto constr : clistTmp) {
+        componentConstraints[components[i]].push_back(constr);
+        ++i;
+    }
+
+    int res = Success;
+    double residualOnly = 0.;  // constraints that depend on no unknown cannot be solved for
+    for (int cid = 0; cid < componentsSize; ++cid) {
+        if (componentConstraints[cid].empty()) {
+            continue;
+        }
+        if (componentParams[cid].empty()) {
+            for (const auto constr : componentConstraints[cid]) {
+                residualOnly = std::max(residualOnly, fabs(constr->error()));
+            }
+            continue;
+        }
+        subsystems.push_back(new SubSystem(componentConstraints[cid], componentParams[cid]));
+        const int status = solve(subsystems.back(), true, alg, true);
+        solved.push_back(status == Success ? 1 : 0);
+        res = std::max(res, status);
+    }
+    if (residualOnly > DL_tolfRedundant) {
+        res = std::max(res, static_cast<int>(Failed));
+    }
+    return res;
+}
+
 void System::identifyConflictingRedundantFromGroups(
     Algorithm alg,
     std::vector<std::vector<Constraint*>>& conflictGroups,
@@ -5886,8 +5964,14 @@ void System::identifyConflictingRedundantFromGroups(
         return (constr->isDriving() && skipped.count(constr) == 0);
     });
 
-    SubSystem* subSysTmp = new SubSystem(clistTmp, pdiagnoselist);
-    int res = solve(subSysTmp, true, alg, true);
+    std::vector<SubSystem*> subSysTmp;
+    std::vector<char> subSysSolved;
+    const int res = solveRedundancyConfirmation(clistTmp, pdiagnoselist, alg, subSysTmp, subSysSolved);
+    // Upstream continues only when the one solve succeeded. Componentwise, the components that
+    // reached Success are applied and confirmed even when another component did not.
+    const bool confirmed = res == Success
+        || (componentwiseDiagnosisSolve
+            && std::ranges::any_of(subSysSolved, [](char status) { return status != 0; }));
 
     if (debugMode == Minimal || debugMode == IterationLevel) {
         std::string solvername;
@@ -5906,8 +5990,12 @@ void System::identifyConflictingRedundantFromGroups(
         Base::Console().log("Sketcher::RedundantSolving-%s-\n", solvername.c_str());
     }
 
-    if (res == Success) {
-        subSysTmp->applySolution();
+    if (confirmed) {
+        for (std::size_t i = 0; i < subSysTmp.size(); ++i) {
+            if (subSysSolved[i] != 0) {
+                subSysTmp[i]->applySolution();
+            }
+        }
         std::ranges::copy_if(
             skipped,
             std::inserter(redundant, redundant.begin()),
@@ -5948,7 +6036,7 @@ void System::identifyConflictingRedundantFromGroups(
             constrNum--;
         }
     }
-    delete subSysTmp;
+    deleteAllContent(subSysTmp);
 
     // simplified output of conflicting tags
     SET_I conflictingTagsSet;
