@@ -39,9 +39,12 @@ This repository is the user's public fork [paulnamalomba/FreeCAD](https://github
 
 | Commit subject | Files | Evidence |
 | --- | --- | --- |
-| Solve with caller-supplied redundancy | `planegcs/GCS.{h,cpp}` | SESKAFEA C1.4b PS1; X2 r2 peak 176.8 MiB on `limit-budget-two-1024` from the whole-sketch dense diagnosis inside `solve` |
-| Assemble subsystem Jacobians sparsely | `planegcs/SubSystem.{h,cpp}` | SESKAFEA C1.4b PS3 |
-| Sparse DogLeg Gauss-Newton step | `planegcs/GCS.{h,cpp}` | SESKAFEA C1.4b PS4; dense `Jx`, `Jx_new` and `fullPivLu` need at least 1 GiB at 8,192 unknowns |
+| Solve with caller-supplied redundancy | `planegcs/GCS.{h,cpp}` | SESKAFEA C1.4b PS1. Raw: X2 r2 peak 176.8 MiB on `limit-budget-two-1024` from the whole-sketch dense diagnosis inside `solve`, and `Converged`-at-start on the two compatible-redundant fixtures. Tests: `X2PatchTests.py` ps1 and `X2PlaneGcsPatchUnit.cpp` ps1-* |
+| Diagnose with a sparse Jacobian and sparse QR | `planegcs/GCS.{h,cpp}` | SESKAFEA C1.4b PS2. Tests: `X2PatchTests.py` ps2 (lists equal to the upstream sparse-QR path on every fixture; size rule) and `X2PlaneGcsPatchUnit.cpp` ps2-* |
+| Confirm diagnosed redundancy per connected component | `planegcs/GCS.{h,cpp}` | SESKAFEA C1.4b PS3. Tests: `X2PlaneGcsPatchUnit.cpp` ps3-* (one stalled component), `X2PatchTests.py` ps3 |
+| Add a sparse DogLeg Gauss-Newton step | `planegcs/GCS.{h,cpp}`, `planegcs/SubSystem.{h,cpp}` | SESKAFEA C1.4b PS4. Dense `Jx`, `Jx_new` and `fullPivLu` need at least 1 GiB at 8,192 unknowns. The step is the quasi-definite system with one `delta` and no QR path (a per-row `delta` with a QR fallback, and a `J J^T` step before it, were replaced). Tests: `X2PlaneGcsPatchUnit.cpp` ps4-shipped-step (dense reference, twelve systems), `X2StepProbe.cpp`, `X2PatchTests.py` ps4 and stress (23 fixtures, solve at most 91 MiB, zero fallback calls) |
+
+The tests live in the SESKAFEA frontend repository, branch `x2/planegcs-requal`, folder `verification/geometry/x2-solver/`.
 
 ## Shared instruction entry points
 
