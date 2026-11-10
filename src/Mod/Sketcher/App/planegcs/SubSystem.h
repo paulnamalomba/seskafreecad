@@ -27,6 +27,7 @@
 #undef max
 
 #include <Eigen/Core>
+#include <Eigen/SparseCore>
 
 #include "Constraints.h"
 
@@ -78,6 +79,10 @@ public:
     void calcResidual(Eigen::VectorXd& r, double& err);
     void calcJacobi(VEC_pD& params, Eigen::MatrixXd& jacobi);
     void calcJacobi(Eigen::MatrixXd& jacobi);
+    // The Jacobian as a sparse csize x psize matrix. Its structure is the constraint-to-parameter
+    // adjacency c2p, so grad() is evaluated only for the parameters a constraint depends on. The
+    // entries equal those of calcJacobi(), which evaluates every constraint-parameter pair.
+    void calcJacobiSparse(Eigen::SparseMatrix<double>& jacobi);
     void calcGrad(VEC_pD& params, Eigen::VectorXd& grad);
     void calcGrad(Eigen::VectorXd& grad);
 

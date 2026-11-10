@@ -489,6 +489,8 @@ System::System()
     , autoQRThreshold(1000)
     , sparseDiagnosis(false)
     , componentwiseDiagnosisSolve(false)
+    , sparseStepCalls(0)
+    , sparseStepPassLimit(0)
     , dogLegGaussStep(FullPivLU)
     , qrpivotThreshold(1E-13)
     , debugMode(Minimal)
@@ -2308,6 +2310,12 @@ int System::solve_LM(SubSystem* subsys, bool isRedundantsolving)
 
 int System::solve_DL(SubSystem* subsys, bool isRedundantsolving)
 {
+#ifdef EIGEN_SPARSEQR_COMPATIBLE
+    if (dogLegGaussStep == SparseLeastNorm) {
+        return solve_DLSparse(subsys, isRedundantsolving);
+    }
+#endif
+
 #ifdef _GCS_EXTRACT_SOLVER_SUBSYSTEM_
     extractSubsystem(subsys, isRedundantsolving);
 #endif
@@ -2339,8 +2347,10 @@ int System::solve_DL(SubSystem* subsys, bool isRedundantsolving)
                << ", dogLegGaussStep: "
                << (dogLegGaussStep == FullPivLU
                        ? "FullPivLU"
-                       : (dogLegGaussStep == LeastNormFullPivLU ? "LeastNormFullPivLU"
-                                                                : "LeastNormLdlt"))
+                       : (dogLegGaussStep == LeastNormFullPivLU
+                              ? "LeastNormFullPivLU"
+                              : (dogLegGaussStep == SparseLeastNorm ? "LeastNormLdlt (no sparse support)"
+                                                                    : "LeastNormLdlt")))
                << ", xsize: " << xsize << ", csize: " << csize << ", maxIter: " << maxIterNumber
                << "\n";
 
@@ -2411,6 +2421,7 @@ int System::solve_DL(SubSystem* subsys, bool isRedundantsolving)
             case LeastNormFullPivLU:
                 h_gn = Jx.adjoint() * (Jx * Jx.adjoint()).fullPivLu().solve(-fx);
                 break;
+            case SparseLeastNorm:  // dispatched to solve_DLSparse() above when Eigen has sparse support
             case LeastNormLdlt:
                 h_gn = Jx.adjoint() * (Jx * Jx.adjoint()).ldlt().solve(-fx);
                 break;
@@ -2521,6 +2532,273 @@ int System::solve_DL(SubSystem* subsys, bool isRedundantsolving)
 
     return (stop == 1) ? Success : Failed;
 }
+
+#ifdef EIGEN_SPARSEQR_COMPATIBLE
+bool sparseGaussNewtonStep(const Eigen::SparseMatrix<double>& J, const Eigen::VectorXd& fx, Eigen::VectorXd& h)
+{
+    const int m = static_cast<int>(J.rows());
+    const int n = static_cast<int>(J.cols());
+
+    Eigen::VectorXd rowNorm2 = Eigen::VectorXd::Zero(m);
+    for (int c = 0; c < J.outerSize(); ++c) {
+        for (Eigen::SparseMatrix<double>::InnerIterator it(J, c); it; ++it) {
+            rowNorm2[it.row()] += it.value() * it.value();
+        }
+    }
+    h = Eigen::VectorXd::Zero(n);
+    const double largest = m > 0 ? rowNorm2.maxCoeff() : 0.;
+    if (!(largest > 0.)) {
+        return true;  // J = 0: no step
+    }
+    const double delta = 1e-9 * largest;
+
+    // lower triangle of K = [[I, J^T], [J, -delta I]]
+    std::vector<Eigen::Triplet<double>> entries;
+    entries.reserve(static_cast<std::size_t>(n + m + J.nonZeros()));
+    for (int i = 0; i < n; ++i) {
+        entries.emplace_back(i, i, 1.0);
+    }
+    for (int i = 0; i < m; ++i) {
+        entries.emplace_back(n + i, n + i, -delta);
+    }
+    for (int c = 0; c < J.outerSize(); ++c) {
+        for (Eigen::SparseMatrix<double>::InnerIterator it(J, c); it; ++it) {
+            entries.emplace_back(n + it.row(), it.col(), it.value());
+        }
+    }
+    Eigen::SparseMatrix<double> K(n + m, n + m);
+    K.setFromTriplets(entries.begin(), entries.end());
+    entries.clear();
+    entries.shrink_to_fit();
+
+    Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt;
+    ldlt.compute(K);
+    if (ldlt.info() != Eigen::Success) {
+        return false;  // not expected for a quasi-definite K; h = 0 shrinks the DogLeg trust region
+    }
+
+    bool converged = false;
+    Eigen::VectorXd rhs = Eigen::VectorXd::Zero(n + m);
+    for (int pass = 0; pass < 12; ++pass) {
+        rhs.tail(m) = -fx - J * h;
+        const Eigen::VectorXd correction = ldlt.solve(rhs).head(n);
+        h += correction;
+        if (correction.norm() <= 1e-14 * h.norm()) {
+            converged = true;
+            break;
+        }
+    }
+    if (!h.allFinite()) {
+        h = Eigen::VectorXd::Zero(n);
+        return false;
+    }
+    return converged;
+}
+
+int System::solve_DLSparse(SubSystem* subsys, bool isRedundantsolving)
+{
+#ifdef _GCS_EXTRACT_SOLVER_SUBSYSTEM_
+    extractSubsystem(subsys, isRedundantsolving);
+#endif
+
+    int xsize = subsys->pSize();
+    int csize = subsys->cSize();
+
+    if (xsize == 0) {
+        return Success;
+    }
+
+    double tolg = DL_tolg;
+    double tolx = DL_tolx;
+    double tolf = DL_tolf;
+
+    int maxIterNumber = (sketchSizeMultiplier ? maxIter * xsize : maxIter);
+    if (isRedundantsolving) {
+        tolg = DL_tolgRedundant;
+        tolx = DL_tolxRedundant;
+        tolf = DL_tolfRedundant;
+
+        maxIterNumber = (sketchSizeMultiplierRedundant ? maxIterRedundant * xsize : maxIterRedundant);
+    }
+
+    if (debugMode == IterationLevel) {
+        std::stringstream stream;
+        stream << "DLSparse: tolg: " << tolg << ", tolx: " << tolx << ", tolf: " << tolf
+               << ", convergence: " << (isRedundantsolving ? convergenceRedundant : convergence)
+               << ", dogLegGaussStep: SparseLeastNorm"
+               << ", xsize: " << xsize << ", csize: " << csize << ", maxIter: " << maxIterNumber
+               << "\n";
+
+        const std::string tmp = stream.str();
+        Base::Console().log(tmp.c_str());
+    }
+
+    Eigen::VectorXd x(xsize), x_new(xsize);
+    Eigen::VectorXd fx(csize), fx_new(csize);
+    Eigen::SparseMatrix<double> Jx, Jx_new;
+    Eigen::VectorXd g(xsize), h_sd(xsize), h_gn(xsize), h_dl(xsize);
+
+    subsys->redirectParams();
+
+    double err;
+    subsys->getParams(x);
+    subsys->calcResidual(fx, err);
+    subsys->calcJacobiSparse(Jx);
+
+    g = Jx.transpose() * (-fx);
+
+    // get the infinity norm fx_inf and g_inf
+    double g_inf = g.lpNorm<Eigen::Infinity>();
+    double fx_inf = fx.lpNorm<Eigen::Infinity>();
+
+    double divergingLim = 1e6 * err + 1e12;
+
+    double delta = 0.1;
+    double alpha = 0.;
+    double nu = 2.;
+    int iter = 0, stop = 0, reduce = 0;
+    while (!stop) {
+        // check if finished
+        if (fx_inf <= tolf) {
+            // Success
+            stop = 1;
+            break;
+        }
+        else if (g_inf <= tolg) {
+            stop = 2;
+            break;
+        }
+        else if (delta <= tolx * (tolx + x.norm())) {
+            stop = 2;
+            break;
+        }
+        else if (iter >= maxIterNumber) {
+            stop = 4;
+            break;
+        }
+        else if (err > divergingLim || err != err) {
+            // check for diverging and NaN
+            stop = 6;
+            break;
+        }
+
+        // get the steepest descent direction
+        alpha = g.squaredNorm() / (Jx * g).squaredNorm();
+        h_sd = alpha * g;
+
+        // get the gauss-newton step (least norm, sparse)
+        ++sparseStepCalls;
+        if (!sparseGaussNewtonStep(Jx, fx, h_gn)) {
+            ++sparseStepPassLimit;
+        }
+
+        double rel_error = (Jx * h_gn + fx).norm() / fx.norm();
+        if (rel_error > 1e15) {
+            break;
+        }
+
+        // compute the dogleg step
+        if (h_gn.norm() < delta) {
+            h_dl = h_gn;
+            if (h_dl.norm() <= tolx * (tolx + x.norm())) {
+                stop = 5;
+                break;
+            }
+        }
+        else if (alpha * g.norm() >= delta) {
+            h_dl = (delta / (alpha * g.norm())) * h_sd;
+        }
+        else {
+            // compute beta
+            double beta = 0;
+            Eigen::VectorXd b = h_gn - h_sd;
+            double bb = (b.transpose() * b).norm();
+            double gb = (h_sd.transpose() * b).norm();
+            double c = (delta + h_sd.norm()) * (delta - h_sd.norm());
+
+            if (gb > 0) {
+                beta = c / (gb + sqrt(gb * gb + c * bb));
+            }
+            else {
+                beta = (sqrt(gb * gb + c * bb) - gb) / bb;
+            }
+
+            // and update h_dl and dL with beta
+            h_dl = h_sd + beta * b;
+        }
+
+        // get the new values
+        double err_new;
+        x_new = x + h_dl;
+        subsys->setParams(x_new);
+        subsys->calcResidual(fx_new, err_new);
+        subsys->calcJacobiSparse(Jx_new);
+
+        // calculate the linear model and the update ratio
+        double dL = err - 0.5 * (fx + Jx * h_dl).squaredNorm();
+        double dF = err - err_new;
+        double rho = dL / dF;
+
+        if (dF > 0 && dL > 0) {
+            x = x_new;
+            Jx = Jx_new;
+            fx = fx_new;
+            err = err_new;
+
+            g = Jx.transpose() * (-fx);
+
+            // get infinity norms
+            g_inf = g.lpNorm<Eigen::Infinity>();
+            fx_inf = fx.lpNorm<Eigen::Infinity>();
+        }
+        else {
+            rho = -1;
+        }
+
+        // update delta
+        if (fabs(rho - 1.) < 0.2 && h_dl.norm() > delta / 3. && reduce <= 0) {
+            delta = 3 * delta;
+            nu = 2;
+            reduce = 0;
+        }
+        else if (rho < 0.25) {
+            delta = delta / nu;
+            nu = 2 * nu;
+            reduce = 2;
+        }
+        else {
+            reduce--;
+        }
+
+        if (debugMode == IterationLevel) {
+            std::stringstream stream;
+            // Iteration: 1, residual: 1e-3, tolg: 1e-5, tolx: 1e-3
+            stream << "DLSparse, Iteration: " << iter << ", fx_inf(tolf): " << fx_inf
+                   << ", g_inf(tolg): " << g_inf << ", delta(f(tolx)): " << delta
+                   << ", err(divergingLim): " << err << "\n";
+
+            const std::string tmp = stream.str();
+            Base::Console().log(tmp.c_str());
+        }
+
+        // count this iteration and start again
+        iter++;
+    }
+
+    subsys->revertParams();
+
+    if (debugMode == IterationLevel) {
+        std::stringstream stream;
+        stream << "DLSparse: stopcode: " << stop << ((stop == 1) ? ", Success" : ", Failed") << "\n";
+
+        const std::string tmp = stream.str();
+        Base::Console().log(tmp.c_str());
+    }
+
+    return (stop == 1) ? Success : Failed;
+}
+
+#endif  // EIGEN_SPARSEQR_COMPATIBLE
 
 #ifdef _GCS_EXTRACT_SOLVER_SUBSYSTEM_
 void System::extractSubsystem(SubSystem* subsys, bool isRedundantsolving)

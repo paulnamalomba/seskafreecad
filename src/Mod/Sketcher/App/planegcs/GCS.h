@@ -69,7 +69,17 @@ enum DogLegGaussStep
 {
     FullPivLU = 0,
     LeastNormFullPivLU = 1,
-    LeastNormLdlt = 2
+    LeastNormLdlt = 2,
+    // The DogLeg Gauss-Newton step from sparse matrices, with no J J^T or J^T J formed and no QR. The
+    // step is h = J^T (J J^T + delta I)^-1 q refined as described at sparseGaussNewtonStep: for J of
+    // full row rank it is the least-norm step (as LeastNormLdlt); for a consistent rank-deficient J
+    // (redundant constraints that agree) it is the minimum-norm solution of J h = -f; for an
+    // inconsistent J (conflicting constraints, or redundant nonlinear rows away from a solution) it
+    // is the minimum-norm solution of the least-squares problem min |J h + f|, which is FullPivLU's
+    // answer only when J has full column rank. Directions with a singular value below about
+    // sqrt(delta) = 3e-5 |J_i|max are damped (Levenberg-like) instead of inverted. Only the DogLeg
+    // solver reads it. Without Eigen's sparse module (before 3.2.2) it behaves as LeastNormLdlt.
+    SparseLeastNorm = 3
 };
 
 enum QRAlgorithm
@@ -150,6 +160,8 @@ private:
     int solve_BFGS(SubSystem* subsys, bool isFine = true, bool isRedundantsolving = false);
     int solve_LM(SubSystem* subsys, bool isRedundantsolving = false);
     int solve_DL(SubSystem* subsys, bool isRedundantsolving = false);
+    // solve_DL() with sparse Jacobians and the sparse Gauss-Newton step (SparseLeastNorm)
+    int solve_DLSparse(SubSystem* subsys, bool isRedundantsolving = false);
 
     void makeReducedJacobian(
         Eigen::MatrixXd& J,
@@ -315,6 +327,11 @@ public:
     // own); and a system with no unknown at all is solved as upstream (Success). Default false:
     // as upstream.
     bool componentwiseDiagnosisSolve;
+    // Statistics of DogLegGaussStep::SparseLeastNorm, never reset by the solver: the number of
+    // Gauss-Newton steps taken, and the number of those whose refinement used all twelve passes without
+    // the correction reaching 1e-14 of h (inconsistent or nearly singular systems).
+    unsigned long sparseStepCalls;
+    unsigned long sparseStepPassLimit;
     DogLegGaussStep dogLegGaussStep;
     double qrpivotThreshold;
     DebugMode debugMode;
@@ -783,6 +800,28 @@ protected:
 void deleteAllContent(VEC_pD& doublevec);
 void deleteAllContent(std::vector<Constraint*>& constrvec);
 void deleteAllContent(std::vector<SubSystem*>& subsysvec);
+
+#ifdef EIGEN_SPARSEQR_COMPATIBLE
+// The Gauss-Newton step of DogLegGaussStep::SparseLeastNorm for a sparse J and residual fx. Declared for the
+// unit tests that compare it with dense references; production code reaches it through solve_DL().
+//   1. delta = 1e-9 max_i |J_i|^2, the same for every row. K = [[I, J^T], [J, -delta I]] is symmetric
+//      quasi-definite (pivots +1 and -delta, no zero pivot) and is factored by SimplicialLDLT with a
+//      fill-reducing order. An unknown or an equation shared by many rows is one node of K, not a dense
+//      block: fill is O(nnz(J) + k (m + n)) for k such nodes. Nothing else is allocated at that scale.
+//   2. h starts at 0. Each pass solves K [a; b] = [0; q] with q = -fx - J h and sets h += a. This is
+//      h += J^T (J J^T + delta I)^-1 q, which contracts a singular-value direction sigma by
+//      delta / (sigma^2 + delta) per pass and leaves the part of q in the null space of J^T (the
+//      inconsistent part) out, so h stays in range(J^T). A uniform delta is what makes the limit the
+//      unweighted least-squares step: J^T (J J^T + delta I)^-1 q = 0 if and only if J^T q = 0.
+//      Passes stop when the correction of h is 1e-14 of h, or after twelve.
+//   3. The result is the minimum-norm least-squares step to the accuracy of those passes. For full row
+//      rank, or consistent rank deficiency, that is the least-norm or minimum-norm solution of J h = -fx.
+//      Directions with sigma below about sqrt(delta) |J_i|max are damped, not inverted: on a nearly
+//      singular J the step is Levenberg-like, and the DogLeg trust-region test accepts or shrinks it.
+//   There is no QR fallback. The function returns true when the correction reached 1e-14 of h within the
+//   twelve passes. A non-finite step is returned as zero. The step never allocates more than step 1.
+bool sparseGaussNewtonStep(const Eigen::SparseMatrix<double>& J, const Eigen::VectorXd& fx, Eigen::VectorXd& h);
+#endif
 
 }  // namespace GCS
 
