@@ -30,7 +30,7 @@ This repository is the user's public fork [paulnamalomba/FreeCAD](https://github
 
 `PLANEGCS_INTERNAL_VERSION` holds the fork's four-part identity, `<breaking>.<major>.<minor>.<build>`, seeded unbuilt at `1.1.4.0`.
 - A build is qualifying when the consumer's acceptance builds this fork commit from its archive and passes its required checks. The first qualifying build advances the version to `1.1.4.1`.
-- Major, minor and build each range from 0 to 9, and overflow carries (`1.1.4.9 -> 1.1.5.0`), as in the MS-MPI and OCCT forks.
+- Major and minor each range from 0 to 9. **Required (user, 17 November 2026):** the build field ranges from 0 to 99 without zero padding, as in every owned repository. It counts up (`1.1.4.9 -> 1.1.4.10`) and overflow carries (`1.1.4.99 -> 1.1.5.0`, `1.1.9.99 -> 1.2.0.0`, `1.9.9.99 -> 2.0.0.0`); a build field of 100 is refused. This supersedes the earlier one-digit build field; no build was accepted under it.
 - Failed, configure-only and documentation-only work does not advance it.
 - Notes are Markdown, grouped under `.commits/<breaking>.<major>.<minor>.md`.
 - The user may re-seed or change this scheme.
